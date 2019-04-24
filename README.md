@@ -4,6 +4,7 @@ Simple Graylog CLI for viewing messages
 Originally came from https://github.com/bvargo/gtail.
 I converted it to Python3 and added some features.
 
+```
 usage: graylog [-h] [--list-streams] [--query QUERY [QUERY ...]]
                [--limit LIMIT] [--stream STREAM_NAMES [STREAM_NAMES ...]]
                [--tail] [--config CONFIG_PATHS [CONFIG_PATHS ...]]
@@ -42,3 +43,4 @@ uri: http://graylog.example.com:12900
 ; optional username and password
 username: USERNAME
 password: PASSWORD
+```
