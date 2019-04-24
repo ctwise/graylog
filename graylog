@@ -70,7 +70,7 @@ This file should be located at any of the following paths: %s.
     parser.add_argument("--config", '-c', dest="config_paths",
                         nargs="+",
                         help="Config files. Default: " + ", ".join(DEFAULT_CONFIG_PATHS))
-    parser.add_argument("--range", '-r', dest="time_range", default="2h",
+    parser.add_argument("--range", '-r', dest="time_range", default=["2h"],
                         nargs=1,
                         help="Time range to search backwards relative to now (defaults to seconds). "
                              "Examples: 30m, 2h, 4d")
@@ -458,7 +458,7 @@ def main():
             return 1
 
     try:
-        time_range = time_range_to_seconds(args.time_range)
+        time_range = time_range_to_seconds(args.time_range[0])
     except Exception as e:
         print("Unable to parse time_range: ", e)
         print()
