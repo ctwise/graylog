@@ -15,6 +15,7 @@ import urllib3
 import urllib.parse
 import signal
 import re
+from datetime import datetime
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -22,8 +23,18 @@ MAX_DELAY = 10
 DEFAULT_CONFIG_PATHS = [".graylog", os.path.expanduser("~/.graylog")]
 
 
+def long_time(d: datetime):
+    return f"{datetime_from_utc_to_local(d):%Y-%m-%dT%H:%M:%S.%f}"[:-3] + "Z"
+
+
+def datetime_from_utc_to_local(utc_datetime):
+    now_timestamp = time.time()
+    offset = datetime.fromtimestamp(now_timestamp) - datetime.utcfromtimestamp(now_timestamp)
+    return utc_datetime + offset
+
+
 def parse_args():
-    now = f"{datetime.datetime.now():%Y-%m-%dT%H:%M:%S.%f}"[:-3] + "Z"
+    now = long_time(datetime.utcnow())
     absolute_help = f"Absolute time range to search. Provide FROM and TO in the format yyyy-MM-ddTHH:mm:ss.SSSZ (e.g. {now})"
 
     parser = argparse.ArgumentParser(
@@ -285,9 +296,9 @@ def fetch_messages(server_config,
     # extract each message
     messages = list(map(lambda ms: ms["message"], r.json()["messages"]))
 
-    # convert the timestamp
+    # convert the timestamp to a datetime
     for m in messages:
-        m["timestamp"] = datetime.datetime.strptime(m["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ")
+        m["timestamp"] = datetime.strptime(m["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ")
 
     # sort by date
     messages = sorted(messages, key=lambda ms: ms["timestamp"])
@@ -309,7 +320,7 @@ def fetch_messages(server_config,
 # printing of the stream name
 # noinspection PyUnusedLocal
 def print_message(message, streams=None):
-    timestamp = str(message.get("timestamp"))[0:22]
+    timestamp = message.get("timestamp")
     level = message.get("loglevel")
     facility = message.get("facility")
     source = message.get("source")
@@ -355,20 +366,20 @@ def print_message(message, streams=None):
     if level is None:
         level = message.get("level")
 
-    justifed_level = (str(level).ljust(7))[0:7]
+    justified_level = (str(level).ljust(7))[0:7]
 
     if level == 'DEBUG' or level == 'TRACE':
         level = debug_color(level)
-        justifed_level = debug_color(justifed_level)
+        justified_level = debug_color(justified_level)
     if level == 'INFO':
         level = info_color(level)
-        justifed_level = info_color(justifed_level)
+        justified_level = info_color(justified_level)
     if level == 'WARN' or level == 'WARNING':
         level = warn_color(level)
-        justifed_level = warn_color(justifed_level)
+        justified_level = warn_color(justified_level)
     if level == 'ERROR' or level == 'FATAL':
         level = error_color(level)
-        justifed_level = error_color(justifed_level)
+        justified_level = error_color(justified_level)
 
     stream_text = None
     if streams and "streams" in message:
@@ -384,11 +395,11 @@ def print_message(message, streams=None):
     if (client_ip is not None) and (apache_timestamp is not None) and (http_method is not None) and (
             request_page is not None) and (server_response is not None):
         text = f"{client_ip} - [{apache_timestamp}] {http_method} {request_page} {server_response}"
-    elif (timestamp is not None) and (justifed_level is not None) and (short_classname is not None) and (
+    elif (timestamp is not None) and (justified_level is not None) and (short_classname is not None) and (
             message_text is not None):
-        text = f"{timestamp} {justifed_level} {(short_classname.ljust(20))[0:20]} : {message_text}"
-    elif (timestamp is not None) and (justifed_level is not None) and (message_text is not None):
-        text = f"{timestamp} {justifed_level} : {message_text}"
+        text = f"{long_time(timestamp)} {justified_level} {(short_classname.ljust(20))[0:20]} : {message_text}"
+    elif (timestamp is not None) and (justified_level is not None) and (message_text is not None):
+        text = f"{long_time(timestamp)} {justified_level} : {message_text}"
     else:
         text = message_text
         # text = str(message)
@@ -492,14 +503,14 @@ def main():
             continue
 
         # print new messages
-        last_timestamp: datetime = None
+        last_timestamp = None
         for m in messages:
             print_message(m, streams)
             last_message_id = m["_id"]
             last_timestamp = m["timestamp"]
 
         if last_timestamp:
-            delta = (datetime.datetime.utcnow() - last_timestamp)
+            delta = (datetime.utcnow() - last_timestamp)
             seconds_since_last_message = delta.total_seconds()
             delay = min(seconds_since_last_message, MAX_DELAY)
             time_range = str(int(delay + 1))
