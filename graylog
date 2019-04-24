@@ -1,0 +1,518 @@
+#!/usr/local/bin/python3
+#
+# Graylog CLI
+
+from collections import namedtuple
+import configparser
+import argparse
+import datetime
+import os
+import requests
+import sys
+import time
+import urllib
+import urllib3
+import urllib.parse
+import signal
+import re
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+MAX_DELAY = 10
+DEFAULT_CONFIG_PATHS = [".graylog", os.path.expanduser("~/.graylog")]
+
+
+def parse_args():
+    now = f"{datetime.datetime.now():%Y-%m-%dT%H:%M:%S.%f}"[:-3] + "Z"
+    absolute_help = f"Absolute time range to search. Provide FROM and TO in the format yyyy-MM-ddTHH:mm:ss.SSSZ (e.g. {now})"
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Tail logs from Graylog.",
+        epilog="""
+Example configuration file:
+
+[server]
+; Graylog REST API
+uri: http://graylog.example.com:12900
+; optional username and password
+username: USERNAME
+password: PASSWORD
+
+This file should be located at any of the following paths: %s.
+""" % ", ".join(DEFAULT_CONFIG_PATHS))
+    parser.add_argument("--list-streams", dest="list_streams",
+                        action="store_true",
+                        help="List streams and exit.")
+    parser.add_argument("--query", '-q', dest="query",
+                        nargs="+",
+                        help="Query terms to search on. Either query or stream needs to be provided.")
+    parser.add_argument("--limit", '-l', dest="limit", default="100",
+                        nargs=1,
+                        help="The maximum number of messages to display.")
+    parser.add_argument("--stream", '-s', dest="stream_names",
+                        nargs="+",
+                        help="The name of the streams to display. Default: all streams.")
+    parser.add_argument("--tail", '-t', dest="tail",
+                        action="store_true",
+                        help="Whether to tail the output.")
+    parser.add_argument("--config", '-c', dest="config_paths",
+                        nargs="+",
+                        help="Config files. Default: " + ", ".join(DEFAULT_CONFIG_PATHS))
+    parser.add_argument("--range", '-r', dest="time_range", default="2h",
+                        nargs=1,
+                        help="Time range to search backwards relative to now (defaults to seconds). "
+                             "Examples: 30m, 2h, 4d")
+    parser.add_argument("--absolute", '-a', dest="absolute",
+                        nargs=2,
+                        help=absolute_help)
+    return parser.parse_args()
+
+
+def parse_config(config_paths):
+    config = configparser.RawConfigParser()
+    read_paths = config.read(config_paths)
+    if not read_paths:
+        raise IOError("Could not read configuration file: %s" %
+                      ", ".join(config_paths))
+
+    try:
+        uri = config.get("server", "uri")
+    except configparser.NoOptionError:
+        raise Exception("Could not read server uri from configuration file.")
+
+    try:
+        username = config.get("server", "username")
+    except configparser.NoOptionError:
+        username = None
+
+    try:
+        password = config.get("server", "password")
+    except configparser.NoOptionError:
+        password = None
+
+    return Config(ServerConfig(uri, username, password))
+
+
+# finds all stream IDs that should be parsed
+# if a stream name cannot be found, then an Exception is raised
+def find_stream_ids(stream_names, streams):
+    ids = []
+
+    for stream_name in stream_names:
+        ids.append(find_stream_id(stream_name, streams))
+
+    return ids
+
+
+# returns the stream ID
+# if the ID cannot be found, then an exception is raised
+def find_stream_id(stream_name, streams):
+    # all stream names
+    streams_lowercase = set()
+    for stream in streams.values():
+        stream_lowercase = stream["title"].lower()
+        streams_lowercase.add(stream_lowercase)
+
+    # try to find the stream
+    stream_ids = []
+    for stream in streams.values():
+        s = stream["title"].lower()
+        if s.startswith(stream_name):
+            stream_ids.append(stream["id"])
+
+    # if more than one id, reset, and require exact name match
+    if len(stream_ids) > 1:
+        stream_ids = []
+        for stream in streams.values():
+            s = stream["title"]
+            if s == stream_name:
+                stream_ids.append(stream["id"])
+
+    # if the stream was not found, error + list streams
+    if not stream_ids:
+        raise Exception(f"Stream '{stream_name}' could not be found or is not active")
+
+    return stream_ids[0]
+
+
+# No error messages when using Ctrl-C
+# noinspection PyUnusedLocal
+def signal_handler(sig, frame):
+    sys.exit(0)
+
+
+# returns a bold version of text using ansi characters
+def bold(text):
+    make_bold = "\033[1m"
+    reset = "\033[0;0m"
+    return make_bold + str(text) + reset
+
+
+def debug_color(text):
+    make_bold = "\033[94m"
+    reset = "\033[0;0m"
+    return make_bold + str(text) + reset
+
+
+def info_color(text):
+    make_bold = "\033[92m"
+    reset = "\033[0;0m"
+    return make_bold + str(text) + reset
+
+
+def warn_color(text):
+    make_bold = "\033[93m"
+    reset = "\033[0;0m"
+    return make_bold + str(text) + reset
+
+
+def error_color(text):
+    make_bold = "\033[91m"
+    reset = "\033[0;0m"
+    return make_bold + str(text) + reset
+
+
+# fetches the URL from the Graylog server
+def fetch(server_config, url):
+    if server_config.username and server_config.password:
+        auth = (server_config.username, server_config.password)
+    else:
+        auth = None
+
+    headers = {"accept": "application/json"}
+    r = requests.get(url, auth=auth, headers=headers, verify=False)
+    return r
+
+
+# gets a list of active streams
+def fetch_streams(server_config):
+    r = fetch(server_config, server_config.uri + "/streams")
+    streams = r.json()["streams"]
+    # only active streams
+    streams = filter(lambda st: not st["disabled"], streams)
+
+    d = dict()
+    for s in streams:
+        d[s["id"]] = s
+
+    return d
+
+
+# Convert a time range, e.g., 2h or 500s or 3d30m to total seconds
+def time_range_to_seconds(time_range):
+    time_range = "" if time_range is None else time_range
+    range_parts = re.compile('([0-9]*)').split(time_range)
+    range_parts = [part.strip() for part in range_parts if len(part) > 0]
+    total = 0
+    accumulator = 0
+    for part in range_parts:
+        if part.isdigit():
+            accumulator = int(part)
+        else:
+            if part == 's':
+                total += accumulator
+                accumulator = 0
+            elif part == 'm':
+                total += accumulator * 60
+                accumulator = 0
+            elif part == 'h':
+                total += accumulator * 3600
+                accumulator = 0
+            elif part == 'd':
+                total += accumulator * 86400
+                accumulator = 0
+            else:
+                accumulator = 0
+                print("Unknown range element: {part}")
+    total += accumulator
+    return total
+
+
+# lists streams in a pretty format
+def list_streams(streams):
+    streams = sorted(streams.values(), key=lambda s: s["title"].lower())
+    for stream in streams:
+        if stream["description"]:
+            print(bold(stream["title"]), "-", stream["description"])
+        else:
+            print(bold(stream["title"]))
+
+
+# gets messages for the given stream (None = all streams) since the last
+# message ID (None = start from some recent date)
+def fetch_messages(server_config,
+                   query=None,
+                   stream_ids=None,
+                   last_message_id=None,
+                   time_range=7200,
+                   limit=100,
+                   absolute=None):
+    if absolute is None:
+        url = [server_config.uri,
+               "/search/universal/relative?range=",
+               str(time_range),
+               "&limit=",
+               str(limit)]
+    else:
+        url = [server_config.uri,
+               "/search/universal/absolute?from=",
+               absolute[0],
+               "&to=",
+               absolute[1],
+               "&limit=",
+               str(limit)]
+
+    # query terms
+    if query:
+        url.append("&query=" + urllib.parse.quote_plus(query))
+    else:
+        url.append("&query=*")
+
+    # stream ID
+    if stream_ids:
+        quoted = map(urllib.parse.quote_plus, stream_ids)
+        prefixed = map(lambda st: "streams:" + st, quoted)
+        s = "%20OR%20".join(prefixed)
+        url.append("&filter=" + s)
+
+    # fetch
+    url = ''.join(url)
+    r = fetch(server_config, url)
+    if r.status_code != 200:
+        raise Exception(f"Could not fetch messages from server. Status code: {r.status_code}")
+
+    # extract each message
+    messages = list(map(lambda ms: ms["message"], r.json()["messages"]))
+
+    # convert the timestamp
+    for m in messages:
+        m["timestamp"] = datetime.datetime.strptime(m["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ")
+
+    # sort by date
+    messages = sorted(messages, key=lambda ms: ms["timestamp"])
+
+    # exclude any messages that we've seen before
+    index = None
+    for i, m in enumerate(messages):
+        if m["_id"] == last_message_id:
+            index = i
+            break
+    if index is not None:
+        messages = list(messages)[index + 1:]
+
+    return messages
+
+
+# pretty prints a message
+# streams, if provided, is the full list of streams; it is used for pretty
+# printing of the stream name
+# noinspection PyUnusedLocal
+def print_message(message, streams=None):
+    timestamp = str(message.get("timestamp"))[0:22]
+    level = message.get("loglevel")
+    facility = message.get("facility")
+    source = message.get("source")
+    logger_name = message.get("loggerName")
+    thread = message.get("thread")
+    classname = message.get("classname")
+    application = message.get("application")
+    auth = message.get("auth")
+    ident = message.get("ident")
+    apache_timestamp = message.get("apache_timestamp")
+    request_page = message.get("request_page")
+    client_ip = message.get("client_ip")
+    http_method = message.get("method")
+    http_version = message.get("http_version")
+    client_ip = message.get("client_ip")
+    server_response = message.get("server_response")
+
+    classname = message.get("classname")
+    short_classname = classname
+    if classname is not None:
+        parts = classname.split(".")
+        if len(parts) > 0:
+            short_classname = parts[-1]
+
+    original_message_text = message.get("original_message")
+    if original_message_text is None:
+        original_message_text = message.get("full_message")
+
+    message_text = message.get("message")
+    if message_text is None:
+        message_text = original_message_text
+    if "; nested exception " in message_text:
+        message_text = message_text.replace("; nested exception ", ";\nnested exception ")
+
+    # If we have multiple lines in the original message it's probably a stack trace, tack it onto the message
+    if original_message_text is not None and message_text != original_message_text:
+        extra_info = original_message_text.split('\n')
+        if len(extra_info) == 2:
+            message_text = message_text + "\n" + extra_info[1]
+        if len(extra_info) > 2:
+            message_text = message_text + "\n" + "\n".join(extra_info[1:-1])
+
+    if level is None:
+        level = message.get("level")
+
+    justifed_level = (str(level).ljust(7))[0:7]
+
+    if level == 'DEBUG' or level == 'TRACE':
+        level = debug_color(level)
+        justifed_level = debug_color(justifed_level)
+    if level == 'INFO':
+        level = info_color(level)
+        justifed_level = info_color(justifed_level)
+    if level == 'WARN' or level == 'WARNING':
+        level = warn_color(level)
+        justifed_level = warn_color(justifed_level)
+    if level == 'ERROR' or level == 'FATAL':
+        level = error_color(level)
+        justifed_level = error_color(justifed_level)
+
+    stream_text = None
+    if streams and "streams" in message:
+        stream_ids = message["streams"]
+        stream_names = []
+        for sid in stream_ids:
+            stream_names.append(streams[sid]["title"])
+        stream_text = " ".join(stream_names)
+
+    # Build message
+
+    text = None
+    if (client_ip is not None) and (apache_timestamp is not None) and (http_method is not None) and (
+            request_page is not None) and (server_response is not None):
+        text = f"{client_ip} - [{apache_timestamp}] {http_method} {request_page} {server_response}"
+    elif (timestamp is not None) and (justifed_level is not None) and (short_classname is not None) and (
+            message_text is not None):
+        text = f"{timestamp} {justifed_level} {(short_classname.ljust(20))[0:20]} : {message_text}"
+    elif (timestamp is not None) and (justifed_level is not None) and (message_text is not None):
+        text = f"{timestamp} {justifed_level} : {message_text}"
+    else:
+        text = message_text
+        # text = str(message)
+
+    print(text)
+
+
+def call_delay(args, delay):
+    if not args.tail:
+        return
+    else:
+        time.sleep(delay)
+
+
+# config object and config parsing
+Config = namedtuple("Config", "server_config")
+ServerConfig = namedtuple("ServerConfig", "uri username password")
+
+
+def main():
+    signal.signal(signal.SIGINT, signal_handler)
+
+    args = parse_args()
+
+    #
+    # config file
+    #
+
+    config_paths = DEFAULT_CONFIG_PATHS
+    if args.config_paths:
+        config_paths = args.config_paths
+
+    try:
+        config = parse_config(config_paths)
+    except Exception as e:
+        print("Unable to parse configuration: ", e)
+        return 1
+    server_config = config.server_config
+
+    streams = fetch_streams(server_config)
+
+    # list streams if requested
+    if args.list_streams:
+        list_streams(streams)
+        return 0
+
+    # parse stream name
+    stream_ids = None
+    if args.stream_names:
+        try:
+            stream_ids = find_stream_ids(args.stream_names, streams)
+        except Exception as e:
+            print("Unable to parse stream name: ", e)
+            print()
+            list_streams(streams)
+            return 1
+
+    try:
+        time_range = time_range_to_seconds(args.time_range)
+    except Exception as e:
+        print("Unable to parse time_range: ", e)
+        print()
+        return 1
+
+    try:
+        limit = int(args.limit)
+    except Exception as e:
+        print("Unable to parse limit: ", e)
+        print()
+        return 1
+
+    if args.absolute is not None:
+        args.tail = False
+        limit = max(limit, 300)
+
+    #
+    # print log messages
+    #
+
+    query = None
+    if args.query:
+        query = ' '.join(args.query)
+
+    last_message_id = None
+    while True:
+        delay = MAX_DELAY if args.tail else 0
+
+        # time-forward messages
+        try:
+            messages = fetch_messages(
+                server_config=server_config,
+                query=query,
+                stream_ids=stream_ids,
+                last_message_id=last_message_id,
+                time_range=time_range,
+                limit=limit,
+                absolute=args.absolute)
+        except Exception as e:
+            print("Unable to fetch messages: ", e)
+            call_delay(args, delay)
+            continue
+
+        # print new messages
+        last_timestamp: datetime = None
+        for m in messages:
+            print_message(m, streams)
+            last_message_id = m["_id"]
+            last_timestamp = m["timestamp"]
+
+        if last_timestamp:
+            delta = (datetime.datetime.utcnow() - last_timestamp)
+            seconds_since_last_message = delta.total_seconds()
+            delay = min(seconds_since_last_message, MAX_DELAY)
+            time_range = str(int(delay + 1))
+            if delay > 2:
+                call_delay(args, delay)
+        else:
+            call_delay(args, delay)
+
+        if not args.tail:
+            break
+
+
+if __name__ == "__main__":
+    rc = main()
+    if rc:
+        sys.exit(rc)
