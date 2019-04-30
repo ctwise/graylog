@@ -1,4 +1,4 @@
-#!/usr/local/bin/python3
+#!/usr/bin/env python3
 #
 # Graylog CLI
 
@@ -16,10 +16,38 @@ import urllib.parse
 import signal
 import re
 from datetime import datetime
+import collections
+
+
+class LRUDictionary(collections.MutableMapping):
+
+    def __init__(self, maxlen, *a, **k):
+        self.maxlen = maxlen
+        self.d = dict(*a, **k)
+        while len(self) > maxlen:
+            self.popitem()
+
+    def __iter__(self):
+        return iter(self.d)
+
+    def __len__(self):
+        return len(self.d)
+
+    def __getitem__(self, k):
+        return self.d[k]
+
+    def __delitem__(self, k):
+        del self.d[k]
+
+    def __setitem__(self, k, v):
+        if k not in self and len(self) == self.maxlen:
+            self.popitem()
+        self.d[k] = v
+
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-MAX_DELAY = 10
+MAX_DELAY = 4
 DEFAULT_CONFIG_PATHS = [".graylog", os.path.expanduser("~/.graylog")]
 
 
@@ -255,10 +283,10 @@ def list_streams(streams):
 def fetch_messages(server_config,
                    query=None,
                    stream_ids=None,
-                   last_message_id=None,
                    time_range=7200,
                    limit=100,
-                   absolute=None):
+                   absolute=None,
+                   cache: LRUDictionary = None):
     if absolute is None:
         url = [server_config.uri,
                "/search/universal/relative?range=",
@@ -303,16 +331,17 @@ def fetch_messages(server_config,
     # sort by date
     messages = sorted(messages, key=lambda ms: ms["timestamp"])
 
-    # exclude any messages that we've seen before
-    index = None
-    for i, m in enumerate(messages):
-        if m["_id"] == last_message_id:
-            index = i
-            break
-    if index is not None:
-        messages = list(messages)[index + 1:]
+    filtered_messages = []
 
-    return messages
+    # exclude any messages that we've seen before
+    for i, m in enumerate(messages):
+        if m["_id"] not in cache:
+            filtered_messages.append(m)
+            cache[m["_id"]] = object()
+    if len(filtered_messages) > 0:
+        return filtered_messages
+    else:
+        return []
 
 
 # pretty prints a message
@@ -366,7 +395,10 @@ def print_message(message, streams=None):
     if level is None:
         level = message.get("level")
 
-    justified_level = (str(level).ljust(7))[0:7]
+    if level == 'WARNING':
+        level = 'WARN'
+
+    justified_level = (str(level).ljust(7))[0:5]
 
     if level == 'DEBUG' or level == 'TRACE':
         level = debug_color(level)
@@ -374,7 +406,7 @@ def print_message(message, streams=None):
     if level == 'INFO':
         level = info_color(level)
         justified_level = info_color(justified_level)
-    if level == 'WARN' or level == 'WARNING':
+    if level == 'WARN':
         level = warn_color(level)
         justified_level = warn_color(justified_level)
     if level == 'ERROR' or level == 'FATAL':
@@ -479,11 +511,12 @@ def main():
     # print log messages
     #
 
+    cache = LRUDictionary(1024)
+
     query = None
     if args.query:
         query = ' '.join(args.query)
 
-    last_message_id = None
     while True:
         delay = MAX_DELAY if args.tail else 0
 
@@ -493,31 +526,20 @@ def main():
                 server_config=server_config,
                 query=query,
                 stream_ids=stream_ids,
-                last_message_id=last_message_id,
                 time_range=time_range,
                 limit=limit,
-                absolute=args.absolute)
+                absolute=args.absolute,
+                cache=cache)
         except Exception as e:
             print("Unable to fetch messages: ", e)
             call_delay(args, delay)
             continue
 
         # print new messages
-        last_timestamp = None
         for m in messages:
             print_message(m, streams)
-            last_message_id = m["_id"]
-            last_timestamp = m["timestamp"]
 
-        if last_timestamp:
-            delta = (datetime.utcnow() - last_timestamp)
-            seconds_since_last_message = delta.total_seconds()
-            delay = min(seconds_since_last_message, MAX_DELAY)
-            time_range = str(int(delay + 1))
-            if delay > 2:
-                call_delay(args, delay)
-        else:
-            call_delay(args, delay)
+        call_delay(args, delay)
 
         if not args.tail:
             break
