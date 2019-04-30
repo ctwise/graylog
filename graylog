@@ -16,10 +16,10 @@ import urllib.parse
 import signal
 import re
 from datetime import datetime
-import collections
+from collections.abc import MutableMapping
 
 
-class LRUDictionary(collections.MutableMapping):
+class LRUDictionary(MutableMapping):
 
     def __init__(self, maxlen, *a, **k):
         self.maxlen = maxlen
