@@ -15,6 +15,7 @@ import urllib3
 import urllib.parse
 import signal
 import re
+import itertools
 from datetime import datetime
 from collections.abc import MutableMapping
 
@@ -63,7 +64,8 @@ def datetime_from_utc_to_local(utc_datetime):
 
 def parse_args():
     now = long_time(datetime.utcnow())
-    absolute_help = f"Absolute time range to search. Provide FROM and TO in the format yyyy-MM-ddTHH:mm:ss.SSSZ (e.g. {now})"
+    absolute_help = \
+        f"Absolute time range to search. Provide FROM and TO in the format yyyy-MM-ddTHH:mm:ss.SSSZ (e.g. {now})"
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -83,6 +85,10 @@ This file should be located at any of the following paths: %s.
     parser.add_argument("--list-streams", dest="list_streams",
                         action="store_true",
                         help="List streams and exit.")
+    parser.add_argument("--application", '-a', dest="application", default=None,
+                        nargs=1,
+                        help="Shorthand to specify a query for an application, e.g., -a ms-email is equivalent to -q "
+                             "'application:ms-email'.")
     parser.add_argument("--query", '-q', dest="query",
                         nargs="+",
                         help="Query terms to search on. Either query or stream needs to be provided.")
@@ -102,7 +108,7 @@ This file should be located at any of the following paths: %s.
                         nargs=1,
                         help="Time range to search backwards relative to now (defaults to seconds). "
                              "Examples: 30m, 2h, 4d")
-    parser.add_argument("--absolute", '-a', dest="absolute",
+    parser.add_argument("--absolute", dest="absolute",
                         nargs=2,
                         help=absolute_help)
     return parser.parse_args()
@@ -366,6 +372,7 @@ def print_message(message, streams=None):
     http_version = message.get("http_version")
     client_ip = message.get("client_ip")
     server_response = message.get("server_response")
+    response_size = message.get("bytes")
 
     classname = message.get("classname")
     short_classname = classname
@@ -426,7 +433,11 @@ def print_message(message, streams=None):
     text = None
     if (client_ip is not None) and (apache_timestamp is not None) and (http_method is not None) and (
             request_page is not None) and (server_response is not None):
-        text = f"{client_ip} - [{apache_timestamp}] {http_method} {request_page} {server_response}"
+        if len(request_page) > 1 and request_page[0] != '/':
+            request_page = '/' + request_page
+        display_bytes = '' if response_size is None else response_size
+        text = f"{client_ip} {ident} {auth} [{apache_timestamp}] \"{http_method} {request_page} " \
+            f"HTTP/{http_version}\" {server_response} {display_bytes} "
     elif (timestamp is not None) and (justified_level is not None) and (short_classname is not None) and (
             message_text is not None):
         text = f"{long_time(timestamp)} {justified_level} {(short_classname.ljust(20))[0:20]} : {message_text}"
@@ -439,11 +450,21 @@ def print_message(message, streams=None):
     print(text)
 
 
-def call_delay(args, delay):
+def spinner_delay(delay, spinner):
+    pieces = delay / 0.1
+    for _ in range(int(pieces)):
+        sys.stdout.write(next(spinner))
+        sys.stdout.flush()
+        time.sleep(0.1)
+        sys.stdout.write('\b')
+
+
+def call_delay(args, delay, spinner):
     if not args.tail:
         return
     else:
-        time.sleep(delay)
+        # time.sleep(delay)
+        spinner_delay(delay, spinner)
 
 
 # config object and config parsing
@@ -514,8 +535,15 @@ def main():
     cache = LRUDictionary(1024)
 
     query = None
+    if args.application:
+        query = 'application:' + ' '.join(args.application)
     if args.query:
-        query = ' '.join(args.query)
+        if query:
+            query = query + ' '.join(args.query)
+        else:
+            query = ' '.join(args.query)
+
+    spinner = itertools.cycle(['-', '/', '|', '\\'])
 
     while True:
         delay = MAX_DELAY if args.tail else 0
@@ -532,14 +560,14 @@ def main():
                 cache=cache)
         except Exception as e:
             print("Unable to fetch messages: ", e)
-            call_delay(args, delay)
+            call_delay(args, delay, spinner)
             continue
 
         # print new messages
         for m in messages:
             print_message(m, streams)
 
-        call_delay(args, delay)
+        call_delay(args, delay, spinner)
 
         if not args.tail:
             break
