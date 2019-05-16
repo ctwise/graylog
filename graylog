@@ -67,7 +67,7 @@ def datetime_from_utc_to_local(utc_datetime):
 def parse_args():
     now = long_time(datetime.utcnow())
     absolute_help = \
-        f"Absolute time range to search. Provide FROM and TO in the format yyyy-MM-ddTHH:mm:ss.SSSZ (e.g. {now})"
+        f"Absolute time range to search. Provide FROM and TO in the format 'yyyy-MM-dd HH:mm:ss' (e.g. '{datetime.now():%Y-%m-%d %H:%M:%S}')"
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -327,7 +327,7 @@ def fetch_messages(server_config,
     url = ''.join(url)
     r = fetch(server_config, url)
     if r.status_code != 200:
-        raise Exception(f"Could not fetch messages from server. Status code: {r.status_code}")
+        raise Exception(f"{r.json()['message']}. Status code: {r.status_code}")
 
     # extract each message
     messages = list(map(lambda ms: ms["message"], r.json()["messages"]))
@@ -562,8 +562,7 @@ def main():
                 cache=cache)
         except Exception as e:
             print("Unable to fetch messages: ", e)
-            call_delay(args, delay, spinner)
-            continue
+            exit()
 
         # print new messages
         for m in messages:
