@@ -48,7 +48,9 @@ class LRUDictionary(MutableMapping):
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-MAX_DELAY = 4
+MIN_DELAY = 0.2
+MAX_DELAY = 10.0
+
 DEFAULT_CONFIG_PATHS = [".graylog", os.path.expanduser("~/.graylog")]
 
 
@@ -546,7 +548,7 @@ def main():
     spinner = itertools.cycle(['-', '/', '|', '\\'])
 
     while True:
-        delay = MAX_DELAY if args.tail else 0
+        delay = MIN_DELAY if args.tail else 0
 
         # time-forward messages
         try:
@@ -568,6 +570,13 @@ def main():
             print_message(m, streams)
 
         call_delay(args, delay, spinner)
+        if len(messages) == 0:
+            if delay < MAX_DELAY:
+                delay = delay * 2.0
+                if delay > MAX_DELAY:
+                    delay = MAX_DELAY
+        else:
+            delay = MIN_DELAY
 
         if not args.tail:
             break
