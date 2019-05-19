@@ -42,6 +42,7 @@ optional arguments:
                         Absolute time range to search. Provide FROM and TO in
                         the format 'yyyy-MM-dd HH:mm:ss' (e.g. '2019-05-19
                         09:57:44')
+  --json, -j            Output messages in raw/json format.
 
 Example configuration file:
 
