@@ -6,6 +6,7 @@ from collections import namedtuple
 import configparser
 import argparse
 import datetime
+from dateutil import parser as date_parser
 import os
 import requests
 import sys
@@ -18,27 +19,37 @@ import re
 import itertools
 from datetime import datetime
 from collections.abc import MutableMapping
+from typing import Optional
 
 
 class LRUDictionary(MutableMapping):
+    """
+    Least-Recently-Used Dictionary. Only stores a fixed number of entries in the dictionary. When the limit is hit,
+    the oldest item to be accessed is evicted. Useful as a cache.
+    """
 
-    def __init__(self, maxlen, *a, **k):
+    def __init__(self, maxlen: int, *a, **k):
         self.maxlen = maxlen
         self.d = dict(*a, **k)
         while len(self) > maxlen:
             self.popitem()
 
+
     def __iter__(self):
         return iter(self.d)
+
 
     def __len__(self):
         return len(self.d)
 
+
     def __getitem__(self, k):
         return self.d[k]
 
+
     def __delitem__(self, k):
         del self.d[k]
+
 
     def __setitem__(self, k, v):
         if k not in self and len(self) == self.maxlen:
@@ -46,28 +57,52 @@ class LRUDictionary(MutableMapping):
         self.d[k] = v
 
 
+class StreamParseException(Exception):
+    pass
+
+
+class InvalidRangeException(Exception):
+    pass
+
+
+class InvalidConfiguration(Exception):
+    pass
+
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-MIN_DELAY = 0.2
-MAX_DELAY = 10.0
+MIN_DELAY = 0.2  # In seconds
+MAX_DELAY = 30.0  # In seconds
 
+DEFAULT_LIMIT = 300
 DEFAULT_CONFIG_PATHS = [".graylog", os.path.expanduser("~/.graylog")]
 
+RESET_ESC = "\033[0;0m"
+DEBUG_ESC = "\033[94m"
+INFO_ESC = "\033[92m"
+WARN_ESC = "\033[93m"
+ERROR_ESC = "\033[91m"
 
-def long_time(d: datetime):
+
+def long_time(d: datetime) -> str:
     return f"{datetime_from_utc_to_local(d):%Y-%m-%dT%H:%M:%S.%f}"[:-3] + "Z"
 
 
-def datetime_from_utc_to_local(utc_datetime):
+def datetime_from_utc_to_local(utc_datetime: datetime) -> datetime:
+    """
+    Convert a datetime from the UTC timezone to the local timezone.
+    :param utc_datetime: The UTC datetime.
+    :return: The locate datetime.
+    """
     now_timestamp = time.time()
     offset = datetime.fromtimestamp(now_timestamp) - datetime.utcfromtimestamp(now_timestamp)
     return utc_datetime + offset
 
 
-def parse_args():
-    now = long_time(datetime.utcnow())
+def parse_args() -> dict:
     absolute_help = \
-        f"Absolute time range to search. Provide FROM and TO in the format 'yyyy-MM-dd HH:mm:ss' (e.g. '{datetime.now():%Y-%m-%d %H:%M:%S}')"
+        f"Absolute time range to search. Provide FROM and TO in the format 'yyyy-MM-dd HH:mm:ss' " \
+        f"(e.g. '{datetime.now():%Y-%m-%d %H:%M:%S}')"
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -77,10 +112,24 @@ Example configuration file:
 
 [server]
 ; Graylog REST API
-uri: http://graylog.example.com:12900
+uri: https://my-graylog:9000/api
 ; optional username and password
 username: USERNAME
 password: PASSWORD
+[formats]
+; log formats (list them most specific to least specific, they will be tried in order)
+; all fields must be present or the format won't be applied
+;
+; access log w/bytes
+format1: <{source}> {client_ip} {ident} {auth} [{apache_timestamp}] "{method} {request_page} HTTP/{http_version}" {server_response} {bytes}
+; access log w/o bytes
+format2: <{source}> {client_ip} {ident} {auth} [{apache_timestamp}] "{method} {request_page} HTTP/{http_version}" {server_response}
+; java log entry
+format3: <{source}> {_long_time_timestamp} {_level_color}{loglevel!s:5.5}{_reset} {_short_classname!s:20.20} : {_message_text}
+; syslog
+format4: <{source}> {_long_time_timestamp} {_level_color}{loglevel}{_reset} [{facility}] : {_message_text}
+; generic entry with a loglevel
+format5: <{source}> {_long_time_timestamp} {_level_color}{loglevel}{_reset} : {_message_text}
 
 This file should be located at any of the following paths: %s.
 """ % ", ".join(DEFAULT_CONFIG_PATHS))
@@ -94,6 +143,9 @@ This file should be located at any of the following paths: %s.
     parser.add_argument("--query", '-q', dest="query",
                         nargs="+",
                         help="Query terms to search on. Either query or stream needs to be provided.")
+    parser.add_argument("--export", '-e', dest="fields",
+                        nargs="+",
+                        help="Export specified fields as CSV into a file named export.csv. Requires --absolute option.")
     parser.add_argument("--limit", '-l', dest="limit", default="100",
                         nargs=1,
                         help="The maximum number of messages to display.")
@@ -113,10 +165,77 @@ This file should be located at any of the following paths: %s.
     parser.add_argument("--absolute", dest="absolute",
                         nargs=2,
                         help=absolute_help)
-    return parser.parse_args()
+    args = vars(parser.parse_args())
+
+    if args.get('fields') and not args.get('absolute'):
+        parser.error('The --export option requires the --absolute option')
+
+    if args.get('absolute'):
+        absolute = args.get('absolute')
+        from_date = date_parser.parse(absolute[0])
+        to_date = date_parser.parse(absolute[1])
+        absolute[0] = from_date.strftime("%Y-%m-%d %H:%M:%S")
+        absolute[1] = to_date.strftime("%Y-%m-%d %H:%M:%S")
+
+    server_config = read_config(args)
+    args['server_config'] = server_config
+
+    # parse stream name
+    stream_ids = None
+    if args.get('stream_names'):
+        streams = fetch_streams(server_config)
+        args['streams'] = streams
+        try:
+            stream_ids = find_stream_ids(args.get('stream_names'), streams)
+        except StreamParseException as e:
+            parser.error(f"Unable to parse stream name: {e}")
+    args['stream_ids'] = stream_ids
+
+    time_range = None
+    try:
+        time_range = time_range_to_seconds(args.get('time_range')[0])
+    except InvalidRangeException as e:
+        parser.error(f"Unable to parse time_range: {e}")
+    args['time_range'] = time_range
+
+    limit = DEFAULT_LIMIT
+    try:
+        limit = int(args.get('limit'))
+    except Exception as e:
+        parser.error(f"Unable to parse limit: {e}")
+
+    if args.get('absolute') is not None:
+        args['tail'] = False
+        limit = 0
+
+    fields = args['fields']
+    if fields is not None and len(fields) == 1:
+        fields = fields[0].split(',')
+        args['fields'] = fields
+
+    args['limit'] = limit
+
+    query = None
+    if args.get('application'):
+        query = 'application: ' + ' '.join(args.get('application'))
+    if args.get('query'):
+        if query is not None and len(query) > 0:
+            query = query + ' AND ' + ' '.join(args.get('query'))
+        else:
+            query = ' '.join(args.get('query'))
+    args['query'] = query
+
+    return args
 
 
-def parse_config(config_paths):
+def parse_config(config_paths: list) -> namedtuple:
+    """
+    Parse the configuration file.
+    :param config_paths: The possible configuration file paths.
+    :return: The parsed configuration file.
+    :except IOError: Raised when the configuration file cannot be found or read.
+    :except InvalidConfiguration: Raised when the configuration file can't be parsed.
+    """
     config = configparser.RawConfigParser()
     read_paths = config.read(config_paths)
     if not read_paths:
@@ -126,7 +245,7 @@ def parse_config(config_paths):
     try:
         uri = config.get("server", "uri")
     except configparser.NoOptionError:
-        raise Exception("Could not read server uri from configuration file.")
+        raise InvalidConfiguration("Could not read server uri from configuration file.")
 
     try:
         username = config.get("server", "username")
@@ -138,12 +257,28 @@ def parse_config(config_paths):
     except configparser.NoOptionError:
         password = None
 
-    return Config(ServerConfig(uri, username, password))
+    formats = []
+    try:
+        counter = 1
+        while True:
+            f = config.get("formats", f"format{counter}")
+            formats.append(f)
+            counter += 1
+    except configparser.NoOptionError:
+        pass
+    formats.append("{message_text}")
+
+    return Config(ServerConfig(uri, username, password, formats))
 
 
 # finds all stream IDs that should be parsed
 # if a stream name cannot be found, then an Exception is raised
-def find_stream_ids(stream_names, streams):
+def find_stream_ids(stream_names: list, streams: dict) -> list:
+    """
+    Find all streams that match a list of stream names and accumulate them into a dictionary keyed by stream id.
+    :param stream_names: The list of stream names to find.
+    :param streams: the list of stream ids.
+    """
     ids = []
 
     for stream_name in stream_names:
@@ -154,31 +289,33 @@ def find_stream_ids(stream_names, streams):
 
 # returns the stream ID
 # if the ID cannot be found, then an exception is raised
-def find_stream_id(stream_name, streams):
-    # all stream names
-    streams_lowercase = set()
-    for stream in streams.values():
-        stream_lowercase = stream["title"].lower()
-        streams_lowercase.add(stream_lowercase)
-
+def find_stream_id(stream_name: str, streams: dict) -> str:
+    """
+    Look through the streams defined in Graylog and return the stream id. The search is case independent and will work
+    with partial names, e.g., 'mon' will match with 'MongoDB'.
+    :param stream_name: The full or partial stream name.
+    :param streams: The list of streams returned by Graylog.
+    :return: The located stream id.
+    :except StreamParseException: Thrown when a stream name can't be matched.
+    """
     # try to find the stream
     stream_ids = []
     for stream in streams.values():
         s = stream["title"].lower()
-        if s.startswith(stream_name):
+        if s.startswith(stream_name.lower()):
             stream_ids.append(stream["id"])
 
     # if more than one id, reset, and require exact name match
     if len(stream_ids) > 1:
         stream_ids = []
         for stream in streams.values():
-            s = stream["title"]
-            if s == stream_name:
+            s = stream["title"].lower()
+            if s == stream_name.lower():
                 stream_ids.append(stream["id"])
 
     # if the stream was not found, error + list streams
     if not stream_ids:
-        raise Exception(f"Stream '{stream_name}' could not be found or is not active")
+        raise StreamParseException(f"Stream '{stream_name}' could not be found or is not active")
 
     return stream_ids[0]
 
@@ -190,51 +327,48 @@ def signal_handler(sig, frame):
 
 
 # returns a bold version of text using ansi characters
-def bold(text):
+def bold(text: str):
     make_bold = "\033[1m"
     reset = "\033[0;0m"
     return make_bold + str(text) + reset
 
 
-def debug_color(text):
-    make_bold = "\033[94m"
-    reset = "\033[0;0m"
-    return make_bold + str(text) + reset
-
-
-def info_color(text):
-    make_bold = "\033[92m"
-    reset = "\033[0;0m"
-    return make_bold + str(text) + reset
-
-
-def warn_color(text):
-    make_bold = "\033[93m"
-    reset = "\033[0;0m"
-    return make_bold + str(text) + reset
-
-
-def error_color(text):
-    make_bold = "\033[91m"
-    reset = "\033[0;0m"
-    return make_bold + str(text) + reset
-
-
 # fetches the URL from the Graylog server
-def fetch(server_config, url):
+def fetch(server_config: namedtuple, url: str, request_type: str, stream: bool) -> requests.Response:
+    """
+    Bottom-level function to call a REST API function on the Graylog server and return the results. Anything other then
+    a 200 code responses is a failure.
+    :param server_config: The contents of the server config file.
+    :param url: The Graylog REST API URL.
+    :param request_type: The 'Accept' header value to send to Graylog.
+    :param stream: Whether to stream the response.
+    :return: The response object.
+    """
     if server_config.username and server_config.password:
         auth = (server_config.username, server_config.password)
     else:
         auth = None
 
-    headers = {"accept": "application/json"}
-    r = requests.get(url, auth=auth, headers=headers, verify=False)
-    return r
+    headers = {"accept": request_type}
+    try:
+        r = requests.get(url, auth=auth, headers=headers, verify=False, stream=stream)
+        if r.status_code != 200:
+            print(f"Request to Graylog returned an error: {r.text} [{r.status_code}]")
+            exit(1)
+        return r
+    except requests.exceptions.ConnectionError:
+        print(f"Unable to connect to '{url}'. Please check your configuration file.")
+        exit(1)
 
 
 # gets a list of active streams
-def fetch_streams(server_config):
-    r = fetch(server_config, server_config.uri + "/streams")
+def fetch_streams(server_config: namedtuple) -> dict:
+    """
+    Fetch the raw list of streams from Graylog, ignoring disabled streams.
+    :param server_config: The server configuration file contents.
+    :return: The list of streams as objects.
+    """
+    r = fetch(server_config, server_config.uri + "/streams", "application/json", False)
     streams = r.json()["streams"]
     # only active streams
     streams = filter(lambda st: not st["disabled"], streams)
@@ -246,8 +380,12 @@ def fetch_streams(server_config):
     return d
 
 
-# Convert a time range, e.g., 2h or 500s or 3d30m to total seconds
-def time_range_to_seconds(time_range):
+def time_range_to_seconds(time_range: str) -> int:
+    """
+    Convert a string time range into seconds, e.g., '2h' to 120 seconds or 3d30m to 3 days and 30 minutes of seconds.
+    :param time_range: The time range as a string.
+    :return: The number of seconds represented by the range.
+    """
     time_range = "" if time_range is None else time_range
     range_parts = re.compile('([0-9]*)').split(time_range)
     range_parts = [part.strip() for part in range_parts if len(part) > 0]
@@ -270,14 +408,17 @@ def time_range_to_seconds(time_range):
                 total += accumulator * 86400
                 accumulator = 0
             else:
-                accumulator = 0
-                print("Unknown range element: {part}")
+                raise InvalidRangeException("Unknown range element: {part}")
     total += accumulator
     return total
 
 
 # lists streams in a pretty format
-def list_streams(streams):
+def list_streams(streams: dict):
+    """
+    List the streams defined in Graylog. They are displayed by 'Title' and sorted alphabetically, ignoring case.
+    :param streams: The stream objects.
+    """
     streams = sorted(streams.values(), key=lambda s: s["title"].lower())
     for stream in streams:
         if stream["description"]:
@@ -288,27 +429,52 @@ def list_streams(streams):
 
 # gets messages for the given stream (None = all streams) since the last
 # message ID (None = start from some recent date)
-def fetch_messages(server_config,
-                   query=None,
-                   stream_ids=None,
-                   time_range=7200,
-                   limit=100,
-                   absolute=None,
-                   cache: LRUDictionary = None):
+def fetch_messages(server_config: namedtuple,
+                   query: str = None,
+                   stream_ids: list = None,
+                   time_range: int = 7200,
+                   limit: int = 100,
+                   absolute: list = None,
+                   fields: list = None,
+                   cache: LRUDictionary = None) -> list:
+    """
+    Fetch messages from Graylog. Makes use of the 'query' or 'streams' to pull messages from the appropriate location.
+    :param server_config: The stored and parsed configuration file.
+    :param query: The Graylog/Elasticsearch query (or None).
+    :param stream_ids: The stream ids to display (or None).
+    :param time_range: The relative time_range in seconds (or None).
+    :param limit: The maximum number of messages to retrieve (or None).
+    :param absolute: The absolute time range to display messages for ([0] from, [1] to).
+    :param fields: The list of fields to export.
+    :param cache: The previous message cache to prevent messages from being pulled twice.
+    :return: The retrieved messages. Never None.
+    """
+    export = False
     if absolute is None:
         url = [server_config.uri,
                "/search/universal/relative?range=",
-               str(time_range),
-               "&limit=",
-               str(limit)]
+               str(time_range)]
     else:
-        url = [server_config.uri,
-               "/search/universal/absolute?from=",
-               absolute[0],
-               "&to=",
-               absolute[1],
-               "&limit=",
-               str(limit)]
+        if fields is None:
+            url = [server_config.uri,
+                   "/search/universal/absolute?from=",
+                   urllib.parse.quote_plus(absolute[0]),
+                   "&to=",
+                   urllib.parse.quote_plus(absolute[1])]
+        else:
+            export = True
+            fields_param = ",".join(fields)
+            url = [server_config.uri,
+                   "/search/universal/absolute/export?from=",
+                   urllib.parse.quote_plus(absolute[0]),
+                   "&to=",
+                   urllib.parse.quote_plus(absolute[1]),
+                   "&fields=",
+                   urllib.parse.quote_plus(fields_param)]
+
+    if limit > 0:
+        url.append("&limit=")
+        url.append(str(limit))
 
     # query terms
     if query:
@@ -320,107 +486,137 @@ def fetch_messages(server_config,
     if stream_ids:
         quoted = map(urllib.parse.quote_plus, stream_ids)
         prefixed = map(lambda st: "streams:" + st, quoted)
-        s = "%20OR%20".join(prefixed)
-        url.append("&filter=" + s)
+        s = " OR ".join(prefixed)
+        url.append("&filter=" + urllib.parse.quote_plus(s))
 
-    # fetch
     url = ''.join(url)
-    r = fetch(server_config, url)
-    if r.status_code != 200:
-        raise Exception(f"{r.json()['message']}. Status code: {r.status_code}")
 
-    # extract each message
-    messages = list(map(lambda ms: ms["message"], r.json()["messages"]))
-
-    # convert the timestamp to a datetime
-    for m in messages:
-        m["timestamp"] = datetime.strptime(m["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ")
-
-    # sort by date
-    messages = sorted(messages, key=lambda ms: ms["timestamp"])
-
-    filtered_messages = []
-
-    # exclude any messages that we've seen before
-    for i, m in enumerate(messages):
-        if m["_id"] not in cache:
-            filtered_messages.append(m)
-            cache[m["_id"]] = object()
-    if len(filtered_messages) > 0:
-        return filtered_messages
-    else:
+    if export:
+        r = fetch(server_config, url, "text/csv", True)
+        print("Exporting...")
+        with open('export.csv', 'wb') as f:
+            for line in r.iter_lines():
+                f.write(line)
+                f.write("\n".encode())
+        print(f"Contents exported to {os.getcwd()}/export.csv")
         return []
+    else:
+        r = fetch(server_config, url, "application/json", False)
+        # extract each message
+        messages = list(map(lambda ms: ms["message"], r.json()["messages"]))
+
+        # convert the timestamp to a datetime
+        for m in messages:
+            m["timestamp"] = datetime.strptime(m["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ")
+
+        # sort by date
+        messages = sorted(messages, key=lambda ms: ms["timestamp"])
+
+        if limit > 0:
+            filtered_messages = []
+
+            # exclude any messages that we've seen before
+            for i, m in enumerate(messages):
+                if m["_id"] not in cache:
+                    filtered_messages.append(m)
+                    cache[m["_id"]] = object()
+            if len(filtered_messages) > 0:
+                return filtered_messages
+            else:
+                return []
+        else:
+            return messages
 
 
-# pretty prints a message
-# streams, if provided, is the full list of streams; it is used for pretty
-# printing of the stream name
 # noinspection PyUnusedLocal
-def print_message(message, streams=None):
-    timestamp = message.get("timestamp")
-    level = message.get("loglevel")
-    facility = message.get("facility")
-    source = message.get("source")
-    logger_name = message.get("loggerName")
-    thread = message.get("thread")
-    classname = message.get("classname")
-    application = message.get("application")
-    auth = message.get("auth")
-    ident = message.get("ident")
-    apache_timestamp = message.get("apache_timestamp")
+def print_message(server_config: namedtuple, message: dict, streams: dict = None):
+    """
+    Pretty-prints a log message. If the streams are provided, they are a list of stream ids.
+    :param server_config: The configuration file contents.
+    :param message: The message to display.
+    :param streams: The stream ids.
+    """
+    adjust_message(message, streams)
+
+    # Build message
+
+    text = None
+    for f in server_config.formats:
+        text = try_format(message, f)
+        if text is not None:
+            break
+
+    print(text)
+
+
+def adjust_message(message: dict, streams: dict):
+    """
+    Adjust the message object by normalizing values and adding computed fields. All computed fields are preceded by an
+    underscore. The computed fields are:
+    - _long_time_timestamp : the timestamp in the format: 'yyyy-mm-ddThh:mm:ss.sssZ'
+    - _short_classname : the final part of a Java-style classname found in the 'classname' field.
+    - _message_text : the 'message' field modified for better display and with additional lines taken from the
+      'original_message' or 'full_message' fields.
+    - _level_color : the escape sequence that will output the appropriate color for the error level of the message
+    - _reset : the escape sequence to return the color to normal
+    - _matching_streams : the streams the message belongs to (if any)
+    :param message: The log message object.
+    :param streams: The streams that provided the messages (if any)
+    """
+    # Sometimes request_page is missing the leading slash
     request_page = message.get("request_page")
-    client_ip = message.get("client_ip")
-    http_method = message.get("method")
-    http_version = message.get("http_version")
-    client_ip = message.get("client_ip")
-    server_response = message.get("server_response")
-    response_size = message.get("bytes")
+    if request_page is not None and len(request_page) > 1 and request_page[0] != '/':
+        message['request_page'] = '/' + request_page
 
+    # If 'original_message' is missing, use the value of 'full_message' if available
+    original_message = message.get("original_message")
+    if original_message is None:
+        original_message = message.get("full_message")
+        message['original_message'] = original_message
+
+    # Add the computed field '_long_time_timestamp' with the timestamp in format: 'yyyy-mm-ddThh:mm:ss.sssZ'
+    timestamp = message.get("timestamp")
+    if timestamp is not None:
+        message['_long_time_timestamp'] = long_time(timestamp)
+
+    # Add the computed field '_short_classname', taking the final part of a Java-style classname.
     classname = message.get("classname")
-    short_classname = classname
     if classname is not None:
-        parts = classname.split(".")
-        if len(parts) > 0:
-            short_classname = parts[-1]
-
-    original_message_text = message.get("original_message")
-    if original_message_text is None:
-        original_message_text = message.get("full_message")
+        message['_short_classname'] = create_short_classname(classname)
 
     message_text = message.get("message")
     if message_text is None:
-        message_text = original_message_text
+        message_text = original_message
     if "; nested exception " in message_text:
         message_text = message_text.replace("; nested exception ", ";\nnested exception ")
-
     # If we have multiple lines in the original message it's probably a stack trace, tack it onto the message
-    if original_message_text is not None and message_text != original_message_text:
-        extra_info = original_message_text.split('\n')
+    if original_message is not None and message_text != original_message:
+        extra_info = original_message.split('\n')
         if len(extra_info) == 2:
             message_text = message_text + "\n" + extra_info[1]
         if len(extra_info) > 2:
             message_text = message_text + "\n" + "\n".join(extra_info[1:-1])
+    message['_message_text'] = message_text
 
+    level = message.get("loglevel")
     if level is None:
         level = message.get("level")
-
     if level == 'WARNING':
         level = 'WARN'
+    message['loglevel'] = level
 
-    justified_level = (str(level).ljust(7))[0:5]
-
+    level_color = None
     if level == 'DEBUG' or level == 'TRACE':
-        level = debug_color(level)
-        justified_level = debug_color(justified_level)
+        level_color = DEBUG_ESC
     if level == 'INFO':
-        level = info_color(level)
-        justified_level = info_color(justified_level)
+        level_color = INFO_ESC
     if level == 'WARN':
-        level = warn_color(level)
-        justified_level = warn_color(justified_level)
+        level_color = WARN_ESC
     if level == 'ERROR' or level == 'FATAL':
-        level = error_color(level)
-        justified_level = error_color(justified_level)
+        level_color = ERROR_ESC
+    if level_color is not None:
+        message['_level_color'] = level_color
+        message['_reset'] = RESET_ESC
 
     stream_text = None
     if streams and "streams" in message:
@@ -429,30 +625,37 @@ def print_message(message, streams=None):
         for sid in stream_ids:
             stream_names.append(streams[sid]["title"])
         stream_text = " ".join(stream_names)
-
-    # Build message
-
-    text = None
-    if (client_ip is not None) and (apache_timestamp is not None) and (http_method is not None) and (
-            request_page is not None) and (server_response is not None):
-        if len(request_page) > 1 and request_page[0] != '/':
-            request_page = '/' + request_page
-        display_bytes = '' if response_size is None else response_size
-        text = f"{client_ip} {ident} {auth} [{apache_timestamp}] \"{http_method} {request_page} " \
-            f"HTTP/{http_version}\" {server_response} {display_bytes} "
-    elif (timestamp is not None) and (justified_level is not None) and (short_classname is not None) and (
-            message_text is not None):
-        text = f"{long_time(timestamp)} {justified_level} {(short_classname.ljust(20))[0:20]} : {message_text}"
-    elif (timestamp is not None) and (justified_level is not None) and (message_text is not None):
-        text = f"{long_time(timestamp)} {justified_level} : {message_text}"
-    else:
-        text = message_text
-        # text = str(message)
-
-    print(text)
+    if stream_text is not None:
+        message['_matching_streams'] = stream_text
 
 
-def spinner_delay(delay, spinner):
+def try_format(message: dict, f: str) -> Optional[str]:
+    try:
+        return f.format(**message)
+    except KeyError:
+        return None
+
+
+def create_short_classname(classname: str) -> str:
+    """
+    Shorten a Java long classname, e.g., java.lang.String, into a short one, e.g., String.
+    :param classname: The classname.
+    :return: The shortened name.
+    """
+    short_classname = classname
+    if classname is not None:
+        parts = classname.split(".")
+        if len(parts) > 0:
+            short_classname = parts[-1]
+    return short_classname
+
+
+def spinner_delay(delay: int, spinner: itertools.cycle):
+    """
+    Display a "spinner" while waiting for a given delay period to pass.
+    :param delay: The delay to wait.
+    :param spinner: The "spinner" iterator that returns the series of spinner characters to display.
+    """
     pieces = delay / 0.1
     for _ in range(int(pieces)):
         sys.stdout.write(next(spinner))
@@ -461,17 +664,68 @@ def spinner_delay(delay, spinner):
         sys.stdout.write('\b')
 
 
-def call_delay(args, delay, spinner):
-    if not args.tail:
-        return
+def read_config(args: dict) -> namedtuple:
+    """
+    Read the server configuration. This contains the Graylog API URL and other settings.
+    :param args: The command-line arguments.
+    :return: parsed server configuration.
+    """
+    config_paths = DEFAULT_CONFIG_PATHS
+    if args.get('config_paths'):
+        config_paths = args.get('config_paths')
+    try:
+        config = parse_config(config_paths)
+        server_config = config.server_config
+        return server_config
+    except Exception as e:
+        print("Unable to parse configuration: ", e)
+        exit(1)
+
+
+def adjust_delay(delay: int, messages: list) -> int:
+    """
+    Adjust the delay between server fetches. The longer it's been since we last saw a message, the long the delay
+    until we try another fetching more.
+
+    :param delay: The current delay.
+    :param messages: The messages we recently received.
+    :return: The adjusted delay.
+    """
+    if len(messages) == 0:
+        if delay < MAX_DELAY:
+            delay *= 2.0
+            if delay > MAX_DELAY:
+                delay = MAX_DELAY
     else:
-        # time.sleep(delay)
-        spinner_delay(delay, spinner)
+        delay = MIN_DELAY
+    return delay
+
+
+def fetch_and_print(args: dict, cache: LRUDictionary) -> list:
+    """
+    Fetch messages from Graylog and display them.
+
+    :param args: The command-line arguments.
+    :param cache: The message cache. Used to prevent overlapping calls from displaying the same messages twice.
+    :return: The messages down pulled from Graylog.
+    """
+    messages = fetch_messages(
+        server_config=args.get('server_config'),
+        query=args.get('query'),
+        stream_ids=args.get('stream_ids'),
+        time_range=args.get('time_range'),
+        limit=args.get('limit'),
+        absolute=args.get('absolute'),
+        fields=args.get('fields'),
+        cache=cache)
+    for m in messages:
+        print_message(args.get('server_config'), m, args.get('streams'))
+    return messages
 
 
 # config object and config parsing
 Config = namedtuple("Config", "server_config")
-ServerConfig = namedtuple("ServerConfig", "uri username password")
+ServerConfig = namedtuple("ServerConfig", "uri username password formats")
 
 
 def main():
@@ -479,109 +733,31 @@ def main():
 
     args = parse_args()
 
-    #
-    # config file
-    #
-
-    config_paths = DEFAULT_CONFIG_PATHS
-    if args.config_paths:
-        config_paths = args.config_paths
-
-    try:
-        config = parse_config(config_paths)
-    except Exception as e:
-        print("Unable to parse configuration: ", e)
-        return 1
-    server_config = config.server_config
-
-    streams = fetch_streams(server_config)
-
     # list streams if requested
-    if args.list_streams:
+    if args.get('list_streams'):
+        streams = args.get('streams')
+        if not streams:
+            streams = fetch_streams(args.get('server_config'))
         list_streams(streams)
-        return 0
-
-    # parse stream name
-    stream_ids = None
-    if args.stream_names:
-        try:
-            stream_ids = find_stream_ids(args.stream_names, streams)
-        except Exception as e:
-            print("Unable to parse stream name: ", e)
-            print()
-            list_streams(streams)
-            return 1
-
-    try:
-        time_range = time_range_to_seconds(args.time_range[0])
-    except Exception as e:
-        print("Unable to parse time_range: ", e)
-        print()
-        return 1
-
-    try:
-        limit = int(args.limit)
-    except Exception as e:
-        print("Unable to parse limit: ", e)
-        print()
-        return 1
-
-    if args.absolute is not None:
-        args.tail = False
-        limit = max(limit, 300)
-
-    #
-    # print log messages
-    #
+        exit(0)
 
     cache = LRUDictionary(1024)
 
-    query = None
-    if args.application:
-        query = 'application:' + ' '.join(args.application)
-    if args.query:
-        if query:
-            query = query + ' '.join(args.query)
-        else:
-            query = ' '.join(args.query)
-
     spinner = itertools.cycle(['-', '/', '|', '\\'])
 
-    while True:
-        delay = MIN_DELAY if args.tail else 0
+    if not args.get('tail'):
+        fetch_and_print(args, cache)
 
-        # time-forward messages
-        try:
-            messages = fetch_messages(
-                server_config=server_config,
-                query=query,
-                stream_ids=stream_ids,
-                time_range=time_range,
-                limit=limit,
-                absolute=args.absolute,
-                cache=cache)
-        except Exception as e:
-            print("Unable to fetch messages: ", e)
-            exit()
+    else:
+        delay = MIN_DELAY
 
-        # print new messages
-        for m in messages:
-            print_message(m, streams)
+        while True:
+            # time-forward messages
+            messages = fetch_and_print(args, cache)
 
-        call_delay(args, delay, spinner)
-        if len(messages) == 0:
-            if delay < MAX_DELAY:
-                delay = delay * 2.0
-                if delay > MAX_DELAY:
-                    delay = MAX_DELAY
-        else:
-            delay = MIN_DELAY
-
-        if not args.tail:
-            break
+            spinner_delay(delay, spinner)
+            delay = adjust_delay(delay, messages)
 
 
 if __name__ == "__main__":
-    rc = main()
-    if rc:
-        sys.exit(rc)
+    main()
