@@ -62,9 +62,9 @@ format2: <{source}> {client_ip} {ident} {auth} [{apache_timestamp}] "{method} {r
 ; java log entry
 format3: <{source}> {_long_time_timestamp} {_level_color}{loglevel!s:5.5}{_reset} {_short_classname!s:20.20} : {_message_text}
 ; syslog
-format4: <{source}> {_long_time_timestamp} {_level_color}{loglevel}{_reset} [{facility}] : {_message_text}
+format4: <{source}> {_long_time_timestamp} {_level_color}{loglevel!s:5.5}{_reset} [{facility}] : {_message_text}
 ; generic entry with a loglevel
-format5: <{source}> {_long_time_timestamp} {_level_color}{loglevel}{_reset} : {_message_text}
+format5: <{source}> {_long_time_timestamp} {_level_color}{loglevel!s:5.5}{_reset} : {_message_text}
 
 This file should be located at any of the following paths: .graylog, /Users/ctwise/.graylog.
 ```
