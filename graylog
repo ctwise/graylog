@@ -7,6 +7,7 @@ import configparser
 import argparse
 import datetime
 from dateutil import parser as date_parser
+import json
 import os
 import requests
 import sys
@@ -165,6 +166,9 @@ This file should be located at any of the following paths: %s.
     parser.add_argument("--absolute", dest="absolute",
                         nargs=2,
                         help=absolute_help)
+    parser.add_argument("--json", '-j', dest="json",
+                        action="store_true",
+                        help="Output messages in raw/json format.")
     args = vars(parser.parse_args())
 
     if args.get('fields') and not args.get('absolute'):
@@ -529,22 +533,26 @@ def fetch_messages(server_config: namedtuple,
 
 
 # noinspection PyUnusedLocal
-def print_message(server_config: namedtuple, message: dict, streams: dict = None):
+def print_message(server_config: namedtuple, message: dict, streams: dict = None, as_json: bool = False):
     """
     Pretty-prints a log message. If the streams are provided, they are a list of stream ids.
     :param server_config: The configuration file contents.
     :param message: The message to display.
     :param streams: The stream ids.
+    :param as_json: Whether to print the message in raw/json format.
     """
     adjust_message(message, streams)
 
     # Build message
 
     text = None
-    for f in server_config.formats:
-        text = try_format(message, f)
-        if text is not None:
-            break
+    if as_json:
+        text = json.dumps(message, ensure_ascii=False, indent=4, sort_keys=True, default=str)
+    else:
+        for f in server_config.formats:
+            text = try_format(message, f)
+            if text is not None:
+                break
 
     print(text)
 
@@ -719,7 +727,7 @@ def fetch_and_print(args: dict, cache: LRUDictionary) -> list:
         fields=args.get('fields'),
         cache=cache)
     for m in messages:
-        print_message(args.get('server_config'), m, args.get('streams'))
+        print_message(args.get('server_config'), m, args.get('streams'), args.get('json'))
     return messages
 
 
