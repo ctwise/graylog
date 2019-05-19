@@ -70,3 +70,15 @@ This file should be located at any of the following paths: .graylog, /Users/ctwi
 ```
 
 Requires the package python-dateutil, e.g., pip3 install python-dateutil.
+
+The formats are attempted IN ORDER. If all fields in a format exist in the message, the format is used and the message is output using that format string.
+
+Fields that begin with an underscore (_) are computed fields. The computed fields available for use are:
+
+- _long_time_timestamp : the message timestamp in the format: 'yyyy-mm-ddThh:mm:ss.sssZ'
+- _short_classname : the final part of a Java-style classname extracted from the 'classname' field.
+- _message_text : the 'message' field modified for clearer display and with additional lines taken from the
+  'original_message' or 'full_message' fields.
+- _level_color : the escape sequence that will output the appropriate color for the error level of the message (taken from the loglevel or level field)
+- _reset : the escape sequence to return the color to normal
+- _matching_streams : the streams the message belongs to (if any)
