@@ -42,8 +42,9 @@ optional arguments:
                         (defaults to seconds). Examples: 30m, 2h, 4d
   --absolute ABSOLUTE ABSOLUTE
                         Absolute time range to search. Provide FROM and TO in
-                        the format 'yyyy-MM-dd HH:mm:ss' (e.g. '2019-05-22
-                        08:17:42')
+                        any format python-dateutils recognizes. Including
+                        '6:45' or '2019-01-04 12:30:00', (e.g. '2019-05-22
+                        08:20:27')
   --json, -j            Output messages in raw/json format.
 
 Example configuration file:
