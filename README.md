@@ -1,15 +1,17 @@
 # graylog
-Simple Graylog CLI for viewing and tailing messages.
+
+Graylog CLI for viewing and tailing messages. You can search the logs, tail a search/application output, use
+Graylog streams (tagged messages), or export log messages to a CSV file.
 
 Originally came from https://github.com/bvargo/gtail.
 I converted it to Python3 and added some features.
 
-```
+```text
 usage: graylog [-h] [--list-streams] [--application APPLICATION]
                [--query QUERY [QUERY ...]] [--export FIELDS [FIELDS ...]]
                [--limit LIMIT] [--stream STREAM_NAMES [STREAM_NAMES ...]]
                [--tail] [--config CONFIG_PATHS [CONFIG_PATHS ...]]
-               [--range TIME_RANGE] [--absolute ABSOLUTE ABSOLUTE]
+               [--range TIME_RANGE] [--absolute ABSOLUTE ABSOLUTE] [--json]
 
 Tail logs from Graylog.
 
@@ -70,9 +72,9 @@ format5: <{source}> {_long_time_timestamp} {_level_color}{loglevel!s:5.5}{_reset
 This file should be located at any of the following paths: .graylog, /Users/ctwise/.graylog.
 ```
 
-Requires the package python-dateutil, e.g., pip3 install python-dateutil.
+Requires the packages python-dateutil and requests, e.g., pip3 install python-dateutil. Easiest way to add packages is 'pip3 install -r requirements.txt'.
 
-The formats are attempted IN ORDER. If all fields in a format exist in the message, the format is used and the message is output using that format string.
+The message outpu formats are attempted IN ORDER. If all fields in a format exist in the message, the format is used and the message is output using that format string.
 
 Fields that begin with an underscore (_) are computed fields. The computed fields available for use are:
 
